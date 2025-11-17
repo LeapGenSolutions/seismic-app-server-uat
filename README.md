@@ -1,1 +1,1 @@
-# seismic-app-server-uat
+# seismic-app-server
