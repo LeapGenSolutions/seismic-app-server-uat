@@ -11,7 +11,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: devops-uat-agent
     permissions:
       contents: read #This is required for actions/checkout
 
@@ -36,7 +36,7 @@ jobs:
           path: .
 
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: devops-uat-agent
     needs: build
     
     steps:
@@ -52,4 +52,5 @@ jobs:
           app-name: 'seismic-app-server-uat'
           slot-name: 'Production'
           package: .
+
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_709536F3DC4540D3AA48FBFBAD776C67 }}
