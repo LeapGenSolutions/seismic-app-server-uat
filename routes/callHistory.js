@@ -43,7 +43,7 @@ router.post("/:id", async (req, res) => {
     if (!reqBody.userID) {
       errorMsg = "UserID is mandatory";
     }
-    await insertCallHistory(id, { ...reqBody, id });
+    await insertCallHistory(id, reqBody);
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: errorMsg || "Failed to Insert into DB" });
