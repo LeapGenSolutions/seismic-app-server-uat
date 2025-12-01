@@ -9,7 +9,7 @@ async function insertCallHistory(id, reqBody) {
     const database = client.database("seismic-backend-athena");
     const container = database.container("seismic_call_history");
     try {
-        const { resource } = await container.items.upsert({ ...reqBody, id });
+       const { resource } = await container.items.upsert({ id, ...reqBody });
         return resource;
     } catch (error) {
         throw new Error("Item not Inserted");
