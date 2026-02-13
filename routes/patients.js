@@ -4,7 +4,8 @@ const { fetchAllPatients, fetchPatientById, createPatient, fetchAllPatientsSeism
 
 router.get("/", async (req, res) => {
   try {
-    const items = await fetchAllPatients();
+    const { clinicName } = req.query;
+    const items = await fetchAllPatients(clinicName);
     res.json(items);
   } catch (err) {
     res.status(500).json({ error: "Internal server error" });
@@ -65,6 +66,7 @@ router.post("/add/chat-bot", async (req, res) => {
     const newPatient = await createPatient(data);
     res.status(201).json(newPatient);
   } catch (err) {
+    console.log(err)
     res.status(500).json({ error: "Internal server error" });
   }
 });
