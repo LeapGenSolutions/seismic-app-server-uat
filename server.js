@@ -1,6 +1,6 @@
+require("dotenv").config();
 const express = require("express");
 const http = require("http");
-const { config } = require("dotenv");
 const cors = require("cors");
 const {
   fetchEmailFromCallHistory,
@@ -25,10 +25,18 @@ const emotionalConnectRouter = require("./routes/emotionalConnect");
 const postCallFeedbackRouter = require("./routes/postCallFeedback");
 const standaloneRouter = require("./routes/standalone");
 const npiRouter = require("./routes/npi");
+const athenaRouter = require("./routes/athena");
+const orderRouter = require("./routes/orders");
+const contactUsRouter = require("./routes/contactUs");
+const rbacRouter = require("./routes/rbac");
+const clinicsRouter = require("./routes/clinics");
+const invitationsRouter = require("./routes/invitations");
+const approvalsRouter = require("./routes/approvals");
+const { initTelemetry } = require("./services/telemetryService");
 
-config();
 
 const PORT = process.env.PORT || 8080;
+initTelemetry();
 
 const app = express();
 // const allowedOrigin = process.env.CORS_ORIGIN_BASE_URL || "https://victorious-mushroom-08b7e7d0f.4.azurestaticapps.net"; // set this in.env
@@ -59,10 +67,16 @@ app.use("/api/call-history", callHistoryRouter);
 app.use("/api/doctor-notes", doctorNotesRouter);
 app.use("/api/emotional-connect", emotionalConnectRouter);
 app.use("/api/post-call-feedback", postCallFeedbackRouter);
-
-
+app.use("/api/athena", athenaRouter);
+app.use("/api/orders", orderRouter);
+app.use("/api/contact-us", contactUsRouter);
+app.use("/api/rbac", rbacRouter);
+app.use("/api/clinics", clinicsRouter);
+app.use("/api/invitations", invitationsRouter);
+app.use("/api/approvals", approvalsRouter);
 app.use("/api/standalone", standaloneRouter);
-app.use("/api/verify-npi",npiRouter)
+app.use("/api/verify-npi",npiRouter);
+
 
 app.post("/get-token", async (req, res) => {
 

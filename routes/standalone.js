@@ -1,6 +1,12 @@
 const express = require("express");
 const router = express.Router();
-const { verifyStandaloneAuth, registerStandaloneUser } = require("../services/standaloneService");
+const {
+  verifyStandaloneAuth,
+  registerStandaloneUser,
+  getRoleRegistrationConfig,
+  normalizeRoleName,
+} = require("../services/standaloneService");
+const { getInvitationForRegistration } = require("../services/invitationsService");
 const { verifyIdToken, generateJWT, extractUserInfo } = require("../services/tokenVerification");
 const { authenticateCIAM, requireRegistration } = require("../middleware/ciamAuth");
 
@@ -66,6 +72,38 @@ router.post("/auth/verify", async (req, res) => {
 router.post("/register", authenticateCIAM, async (req, res) => {
   try {
     const data = req.body;
+    let invitation = null;
+    if (data.invitationToken) {
+      const registrationEmail = data.primaryEmail || req.user.email;
+      invitation = await getInvitationForRegistration(
+        data.invitationToken,
+        registrationEmail
+      );
+      data.clinicName = invitation.clinicName;
+      data.role = invitation.roleName;
+    }
+
+    const normalizedRole = normalizeRoleName(data.role);
+    data.role = normalizedRole;
+    let roleConfig = invitation
+      ? {
+          roleName: invitation.roleName,
+          type: "invited",
+          skipNpiValidation: Boolean(invitation.skipNpiValidation),
+        }
+      : await getRoleRegistrationConfig(
+          normalizedRole,
+          data.clinicName
+        );
+
+    if (!roleConfig) {
+      return res.status(400).json({
+        error: "Invalid role",
+        message: "The selected role is not available for this clinic",
+      });
+    }
+
+    const shouldValidateNpi = !roleConfig.skipNpiValidation;
 
     // Use userId from verified token
     data.userId = req.user.userId;
@@ -76,13 +114,16 @@ router.post("/register", authenticateCIAM, async (req, res) => {
       'lastName',
       'primaryEmail',
       'role',
-      'npiNumber',
       'specialty',
       'statesOfLicense',
       'termsAccepted',
       'privacyAccepted',
       'clinicalResponsibilityAccepted'
     ];
+
+    if (shouldValidateNpi) {
+      required.push("npiNumber");
+    }
 
     const missing = required.filter(field => !data[field]);
 
@@ -94,7 +135,7 @@ router.post("/register", authenticateCIAM, async (req, res) => {
     }
 
     // Validate NPI format (exactly 10 digits)
-    if (!/^\d{10}$/.test(data.npiNumber)) {
+    if (shouldValidateNpi && !/^\d{10}$/.test(data.npiNumber)) {
       return res.status(400).json({
         error: "Invalid NPI number",
         message: "NPI must be exactly 10 digits"
@@ -109,19 +150,17 @@ router.post("/register", authenticateCIAM, async (req, res) => {
       });
     }
 
+    if (invitation && data.primaryEmail.trim().toLowerCase() !== invitation.invitedEmail) {
+      return res.status(403).json({
+        error: "Invitation email mismatch",
+        message: "This invitation must be completed with the invited email address.",
+      });
+    }
+
     // Validate legal agreements are true
     if (!data.termsAccepted || !data.privacyAccepted || !data.clinicalResponsibilityAccepted) {
       return res.status(400).json({
         error: "All legal agreements must be accepted"
-      });
-    }
-
-    // Validate role
-    const validRoles = ['Doctor', 'Nurse Practitioner'];
-    if (!validRoles.includes(data.role)) {
-      return res.status(400).json({
-        error: "Invalid role",
-        message: "Role must be 'Doctor' or 'Nurse Practitioner'"
       });
     }
 
@@ -154,6 +193,22 @@ router.post("/register", authenticateCIAM, async (req, res) => {
       });
     }
 
+    if (
+      error.message === "INVITATION_NOT_FOUND" ||
+      error.message === "INVITATION_ALREADY_USED"
+    ) {
+      return res.status(404).json({
+        error: "Invitation unavailable",
+        message: "This invitation is no longer available.",
+      });
+    }
+
+    if (error.message === "INVITATION_EMAIL_MISMATCH") {
+      return res.status(403).json({
+        error: "Invitation email mismatch",
+        message: "This invitation must be completed with the invited email address.",
+      });
+    }
 
     res.status(500).json({ error: "Internal server error" });
   }

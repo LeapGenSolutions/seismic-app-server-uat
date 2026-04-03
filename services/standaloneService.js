@@ -1,4 +1,78 @@
-const { getUsersContainer } = require("./cosmosClient");
+const { getUsersContainer, getRolesContainer } = require("./cosmosClient");
+const { buildBootstrapOverrides } = require("./bootstrapPermissions");
+const { ensureClinicExists } = require("./clinicsService");
+const {
+  consumeInvitation,
+  getInvitationForRegistration,
+} = require("./invitationsService");
+const { trimClinicName } = require("./clinicUtils");
+
+const SYSTEM_REGISTRATION_ROLES = [
+  { roleName: "Doctor", type: "system", skipNpiValidation: false },
+  { roleName: "Nurse Practitioner", type: "system", skipNpiValidation: false },
+  { roleName: "Staff", type: "system", skipNpiValidation: true },
+];
+
+function normalizeRoleName(roleName) {
+  if (!roleName || typeof roleName !== "string") {
+    return null;
+  }
+
+  const trimmedRoleName = roleName.trim();
+  if (trimmedRoleName === "BO") {
+    return "Staff";
+  }
+
+  return trimmedRoleName;
+}
+
+async function listRegistrationRoles(clinicName = "") {
+  const trimmedClinicName = (clinicName || "").trim();
+
+  if (!trimmedClinicName) {
+    return SYSTEM_REGISTRATION_ROLES;
+  }
+
+  try {
+    const rolesContainer = getRolesContainer();
+    const querySpec = {
+      query:
+        "SELECT c.roleName, c.type, c.skipNpiValidation FROM c WHERE c.clinicName = @clinicName AND c.isActive = true AND c.showInRegistration = true",
+      parameters: [{ name: "@clinicName", value: trimmedClinicName }],
+    };
+
+    const { resources } = await rolesContainer.items.query(querySpec).fetchAll();
+    const customRoles = resources.map((roleDoc) => ({
+      roleName: roleDoc.roleName,
+      type: roleDoc.type || "custom",
+      skipNpiValidation: Boolean(roleDoc.skipNpiValidation),
+    }));
+
+    return [...SYSTEM_REGISTRATION_ROLES, ...customRoles];
+  } catch (error) {
+    console.error("Failed to list registration roles:", error);
+    return SYSTEM_REGISTRATION_ROLES;
+  }
+}
+
+async function getRoleRegistrationConfig(roleName, clinicName = "") {
+  const normalizedRoleName = normalizeRoleName(roleName);
+  if (!normalizedRoleName) {
+    return null;
+  }
+
+  const systemRole = SYSTEM_REGISTRATION_ROLES.find(
+    (role) => role.roleName === normalizedRoleName
+  );
+  if (systemRole) {
+    return systemRole;
+  }
+
+  const availableRoles = await listRegistrationRoles(clinicName);
+  return (
+    availableRoles.find((role) => role.roleName === normalizedRoleName) || null
+  );
+}
 
 async function checkNPIDuplicate(npiNumber) {
   const container = getUsersContainer();
@@ -10,6 +84,26 @@ async function checkNPIDuplicate(npiNumber) {
 
   const { resources } = await container.items.query(querySpec).fetchAll();
   return resources.length > 0;
+}
+
+async function isFirstCompletedUserForClinic(clinicName, userId) {
+  const trimmedClinicName = trimClinicName(clinicName);
+  if (!trimmedClinicName) {
+    return false;
+  }
+
+  const container = getUsersContainer();
+  const querySpec = {
+    query:
+      "SELECT VALUE COUNT(1) FROM c WHERE c.profileComplete = true AND LTRIM(RTRIM(LOWER(c.clinicName))) = @clinicName AND c.userId != @userId",
+    parameters: [
+      { name: "@clinicName", value: trimmedClinicName.toLowerCase() },
+      { name: "@userId", value: userId },
+    ],
+  };
+
+  const { resources } = await container.items.query(querySpec).fetchAll();
+  return (resources[0] || 0) === 0;
 }
 
 
@@ -41,8 +135,12 @@ async function verifyStandaloneAuth(email, userId) {
 
       authType: "CIAM",
       profileComplete: false,
-      prodAccessGranted: true,
+      prodAccessGranted: false,
       isActive: true,
+      customPermissions: {
+        overrides: {},
+      },
+      permissionAuditLog: [],
       created_at: new Date().toISOString(),
       lastLoginAt: new Date().toISOString()
     };
@@ -52,6 +150,7 @@ async function verifyStandaloneAuth(email, userId) {
     return {
       isFirstTime: true,
       profileComplete: false,
+      approvalStatus: null,
       userId: userId,
       email: email
     };
@@ -72,6 +171,7 @@ async function verifyStandaloneAuth(email, userId) {
   return {
     isFirstTime: false,
     profileComplete: user.profileComplete || false,
+    approvalStatus: user.approvalStatus || (user.profileComplete ? "approved" : null),
     userId: user.userId,
     email: user.email,
     userData: user.profileComplete ? {
@@ -79,7 +179,9 @@ async function verifyStandaloneAuth(email, userId) {
       lastName: user.lastName,
       npiNumber: user.npiNumber,
       specialty: user.specialty,
-      role: user.role
+      role: user.role,
+      clinicName: user.clinicName,
+      approvalStatus: user.approvalStatus || "approved",
     } : undefined
   };
 }
@@ -87,11 +189,14 @@ async function verifyStandaloneAuth(email, userId) {
 
 async function registerStandaloneUser(data) {
   const container = getUsersContainer();
+  const registrationEmail = (data.primaryEmail || data.email || "").trim().toLowerCase();
 
    // Check for duplicate NPI
-  const npiExists = await checkNPIDuplicate(data.npiNumber);
-  if (npiExists) {
-    throw new Error("NPI_DUPLICATE");
+  if (data.npiNumber) {
+    const npiExists = await checkNPIDuplicate(data.npiNumber);
+    if (npiExists) {
+      throw new Error("NPI_DUPLICATE");
+    }
   }
 
   // Cross-partition query to fetch existing user record by userId
@@ -107,6 +212,50 @@ async function registerStandaloneUser(data) {
   }
 
   const existingUser = resources[0];
+  const invitation =
+    data.invitationToken
+      ? await getInvitationForRegistration(data.invitationToken, registrationEmail)
+      : null;
+  const clinicName = invitation?.clinicName || data.clinicName || existingUser.clinicName;
+  const normalizedRole = normalizeRoleName(invitation?.roleName || data.role);
+  const isBootstrapClinicAdmin =
+    !existingUser.profileComplete &&
+    (await isFirstCompletedUserForClinic(clinicName, data.userId));
+  const updatedAt = new Date().toISOString();
+  const nextOverrides = isBootstrapClinicAdmin
+    ? buildBootstrapOverrides(
+        normalizedRole,
+        (existingUser.customPermissions && existingUser.customPermissions.overrides) || {}
+      )
+    : {
+        ...((existingUser.customPermissions && existingUser.customPermissions.overrides) || {}),
+      };
+
+  const nextAuditLog = [...(existingUser.permissionAuditLog || [])];
+  if (
+    isBootstrapClinicAdmin &&
+    ((existingUser.customPermissions && existingUser.customPermissions.overrides?.["admin.manage_rbac"]) ||
+      "none") !== "write"
+  ) {
+    nextAuditLog.push({
+      action: "bootstrap_clinic_admin_granted",
+      permission: "admin.manage_rbac",
+      newLevel: "write",
+      performedBy: "system-bootstrap",
+      timestamp: updatedAt,
+      clinicName: trimClinicName(clinicName),
+    });
+  }
+
+  if (isBootstrapClinicAdmin && normalizedRole === "Staff") {
+    nextAuditLog.push({
+      action: "bootstrap_clinic_admin_restricted",
+      newLevel: "admin-only",
+      performedBy: "system-bootstrap",
+      timestamp: updatedAt,
+      clinicName: trimClinicName(clinicName),
+    });
+  }
 
   // Update user with registration data
   const updatedUser = {
@@ -122,15 +271,15 @@ async function registerStandaloneUser(data) {
     secondaryEmail: data.secondaryEmail || "",
 
     // Professional Info
-    role: data.role,
-    npiNumber: data.npiNumber,
+    role: normalizedRole,
+    npiNumber: data.npiNumber || "",
     specialty: data.specialty,
     subSpecialty: data.subSpecialty || "",
     statesOfLicense: data.statesOfLicense,
     licenseNumber: data.licenseNumber || "",
 
     // Practice Info
-    clinicName: data.clinicName || "",
+    clinicName: clinicName || "",
     practiceAddress: data.practiceAddress || {},
 
     // Legal Agreements
@@ -145,7 +294,31 @@ async function registerStandaloneUser(data) {
 
     // Status
     profileComplete: true,
-    updatedAt: new Date().toISOString()
+    approvalStatus: isBootstrapClinicAdmin ? "approved" : "pending",
+    approvedBy: isBootstrapClinicAdmin ? "system-bootstrap" : null,
+    approvedAt: isBootstrapClinicAdmin ? updatedAt : null,
+    rejectedBy: null,
+    rejectedAt: null,
+    invitedBy: invitation?.invitedByEmail || existingUser.invitedBy || null,
+    invitationId: invitation?.id || existingUser.invitationId || null,
+    invitationToken: null,
+    isStandalone: true,
+    signupType: data.signupType || existingUser.signupType || "standalone",
+    prodAccessGranted: isBootstrapClinicAdmin,
+    customPermissions: {
+      ...(existingUser.customPermissions || {}),
+      overrides: nextOverrides,
+      ...((isBootstrapClinicAdmin || invitation)
+        ? {
+            lastUpdatedBy: isBootstrapClinicAdmin
+              ? "system-bootstrap"
+              : "invitation-registration",
+            lastUpdatedAt: updatedAt,
+          }
+        : {}),
+    },
+    permissionAuditLog: nextAuditLog.slice(-50),
+    updatedAt
   };
 
   
@@ -153,7 +326,18 @@ async function registerStandaloneUser(data) {
     .item(existingUser.id, existingUser.id)
     .replace(updatedUser);
 
-        console.log('User standalone Registration : Success, record updated');
+  if (isBootstrapClinicAdmin) {
+    await ensureClinicExists(clinicName, data.userId, registrationEmail);
+  }
+
+  if (invitation) {
+    await consumeInvitation(invitation, {
+      userId: data.userId,
+      email: registrationEmail,
+    });
+  }
+
+  console.log("User standalone Registration : Success, record updated");
 
 
   return resource;
@@ -166,5 +350,8 @@ async function registerStandaloneUser(data) {
 module.exports = {
   verifyStandaloneAuth,
   registerStandaloneUser,
-  checkNPIDuplicate
+  checkNPIDuplicate,
+  listRegistrationRoles,
+  getRoleRegistrationConfig,
+  normalizeRoleName,
 };
